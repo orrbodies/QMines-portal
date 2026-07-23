@@ -1,4 +1,4 @@
-/* QMines Drillhole Database portal — application logic */
+/* QMines Drillhole Database portal — application logic (v2) */
 "use strict";
 
 const sb = window.supabase.createClient(QMINES_CONFIG.SUPABASE_URL, QMINES_CONFIG.SUPABASE_KEY);
@@ -6,7 +6,33 @@ const sb = window.supabase.createClient(QMINES_CONFIG.SUPABASE_URL, QMINES_CONFI
 const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 100;
 const FETCH_CHUNK = 1000;
+const ID_CHUNK = 150; // hole_ids per .in() query, keeps URLs safely short
 const PROJECT_COLORS = { "Mt Chalmers": "#c9573c", "Develin Creek": "#3e7c6f", "Mt Mackenzie": "#5b6da8" };
+const LABEL_ZOOM = 13; // show hole labels at this zoom and closer
+
+/* Grade colour ramps - EDIT RANGES/COLOURS HERE.
+   Values in ppm (Au ppm = g/t). Each band: up to (exclusive) -> colour. */
+const GRADE_RAMPS = {
+  max_cu_ppm: { label: "Max Cu", unit: "ppm", bands: [
+    { upTo: 1000,     color: "#7f9bb3", name: "< 1,000 (<0.1%)" },
+    { upTo: 5000,     color: "#4f9c62", name: "1,000 – 5,000" },
+    { upTo: 10000,    color: "#e0932f", name: "5,000 – 10,000" },
+    { upTo: Infinity, color: "#cf3f2a", name: "\u2265 10,000 (\u22651%)" },
+  ]},
+  max_au_ppm: { label: "Max Au", unit: "g/t", bands: [
+    { upTo: 0.1,      color: "#7f9bb3", name: "< 0.1" },
+    { upTo: 0.5,      color: "#4f9c62", name: "0.1 – 0.5" },
+    { upTo: 1,        color: "#e0932f", name: "0.5 – 1" },
+    { upTo: Infinity, color: "#cf3f2a", name: "\u2265 1" },
+  ]},
+  max_zn_ppm: { label: "Max Zn", unit: "ppm", bands: [
+    { upTo: 5000,     color: "#7f9bb3", name: "< 5,000" },
+    { upTo: 20000,    color: "#4f9c62", name: "5,000 – 20,000" },
+    { upTo: 50000,    color: "#e0932f", name: "20,000 – 50,000" },
+    { upTo: Infinity, color: "#cf3f2a", name: "\u2265 50,000 (\u22655%)" },
+  ]},
+};
+const NO_ASSAY_COLOR = "#9b9b93";
 
 /* ================= auth ================= */
 
@@ -55,7 +81,6 @@ function showLoading(text) { $("loading-text").textContent = text; $("loading-ov
 function hideLoading() { $("loading-overlay").classList.add("hidden"); }
 
 async function fetchAll(buildQuery) {
-  // pages through Supabase's 1000-row cap
   let rows = [], from = 0;
   for (;;) {
     const { data, error } = await buildQuery().range(from, from + FETCH_CHUNK - 1);
@@ -67,10 +92,33 @@ async function fetchAll(buildQuery) {
   return rows;
 }
 
+function chunk(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+const csvEsc = (v) => v == null ? "" : /[",\n]/.test(String(v)) ? '"' + String(v).replaceAll('"', '""') + '"' : String(v);
+function toCSV(rows) {
+  if (!rows.length) return "";
+  const cols = Object.keys(rows[0]);
+  return [cols.join(",")].concat(rows.map((r) => cols.map((c) => csvEsc(r[c])).join(","))).join("\n");
+}
+function downloadBlob(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+const dateStamp = () => new Date().toISOString().slice(0, 10);
+
 /* ================= MAP ================= */
 
-let map = null, holeLayer = null, tenementLayer = null, basemaps = {};
+let map = null, holeLayer = null, tenementLayer = null, drawLayer = null, basemaps = {};
 let allHoles = [];
+let markerByHole = new Map();
+let selectedHoles = null; // array of hole objects inside drawn region, or null
 let appStarted = false;
 
 async function startApp() {
@@ -80,6 +128,7 @@ async function startApp() {
   try {
     showLoading("Loading drillholes\u2026");
     await Promise.all([loadHoles(), loadTenements()]);
+    populateHoleTypes();
     renderHoles();
     hideLoading();
   } catch (err) {
@@ -87,6 +136,7 @@ async function startApp() {
     $("map-count").textContent = "Failed to load data: " + (err.message || err);
   }
   loadProspects();
+  loadTenementList();
   runQuery(true);
 }
 
@@ -100,6 +150,25 @@ function initMap() {
   basemaps.satellite.addTo(map);
   holeLayer = L.layerGroup().addTo(map);
   tenementLayer = L.layerGroup().addTo(map);
+  drawLayer = new L.FeatureGroup().addTo(map);
+
+  // region-draw tools (polygon + rectangle)
+  const drawControl = new L.Control.Draw({
+    position: "topleft",
+    draw: {
+      polygon: { allowIntersection: false, showArea: false,
+                 shapeOptions: { color: "#e0a05c", weight: 2 } },
+      rectangle: { shapeOptions: { color: "#e0a05c", weight: 2 } },
+      polyline: false, circle: false, marker: false, circlemarker: false,
+    },
+    edit: { featureGroup: drawLayer, edit: false, remove: false },
+  });
+  map.addControl(drawControl);
+  map.on(L.Draw.Event.CREATED, (e) => {
+    drawLayer.clearLayers();
+    drawLayer.addLayer(e.layer);
+    applyRegionSelection(e.layer);
+  });
 
   document.querySelectorAll('input[name="basemap"]').forEach((r) =>
     r.addEventListener("change", () => {
@@ -108,58 +177,131 @@ function initMap() {
     }));
   document.querySelectorAll(".f-project, .f-source").forEach((c) => c.addEventListener("change", renderHoles));
   $("f-planned-only").addEventListener("change", renderHoles);
+  $("f-holetype").addEventListener("change", renderHoles);
+  $("colour-mode").addEventListener("change", () => { renderLegend(); renderHoles(); });
   $("f-tenements").addEventListener("change", (e) =>
     e.target.checked ? tenementLayer.addTo(map) : map.removeLayer(tenementLayer));
+  $("f-labels").addEventListener("change", updateLabels);
+  map.on("zoomend moveend", updateLabels);
+  $("sel-clear").addEventListener("click", clearSelection);
+  $("sel-export").addEventListener("click", exportSelection);
 }
 
 async function loadHoles() {
-  allHoles = await fetchAll(() => sb.from("collars").select(
-    "hole_id,project_name,prospect,data_source,source_company,hole_type,latitude,longitude," +
-    "max_depth,year,coordinate_status,mga2020_east,mga2020_north,mga_zone"));
+  const [holes, maxes] = await Promise.all([
+    fetchAll(() => sb.from("collars").select(
+      "hole_id,project_name,prospect,data_source,source_company,hole_type,latitude,longitude," +
+      "max_depth,year,coordinate_status,mga2020_east,mga2020_north,mga_zone,tenement")),
+    fetchAll(() => sb.from("collar_max_assays").select("*")).catch(() => []),
+  ]);
+  const maxByHole = new Map(maxes.map((m) => [m.hole_id, m]));
+  allHoles = holes.map((h) => ({ ...h, ...(maxByHole.get(h.hole_id) || {}) }));
+}
+
+function populateHoleTypes() {
+  const types = [...new Set(allHoles.map((h) => h.hole_type).filter(Boolean))].sort();
+  const opts = '<option value="">All types</option>' + types.map((t) => `<option>${t}</option>`).join("");
+  $("f-holetype").innerHTML = opts;
+  $("d-holetype").innerHTML = opts;
+}
+
+function currentColourMode() { return $("colour-mode").value; }
+
+function colourFor(h) {
+  const mode = currentColourMode();
+  if (mode === "project") return PROJECT_COLORS[h.project_name] || "#888";
+  const ramp = GRADE_RAMPS[mode];
+  const v = h[mode];
+  if (v == null) return NO_ASSAY_COLOR;
+  for (const band of ramp.bands) if (v < band.upTo) return band.color;
+  return ramp.bands[ramp.bands.length - 1].color;
+}
+
+function renderLegend() {
+  const mode = currentColourMode();
+  const box = $("grade-legend");
+  if (mode === "project") { box.classList.add("hidden"); box.innerHTML = ""; return; }
+  const ramp = GRADE_RAMPS[mode];
+  box.innerHTML = `<div class="legend-title">${ramp.label} (${ramp.unit}, primary samples)</div>` +
+    ramp.bands.map((b) => `<div class="legend-row"><span class="swatch" style="background:${b.color}"></span>${b.name}</div>`).join("") +
+    `<div class="legend-row"><span class="swatch" style="background:${NO_ASSAY_COLOR}"></span>no assays</div>`;
+  box.classList.remove("hidden");
+}
+
+function holeVisible(h) {
+  const projects = new Set([...document.querySelectorAll(".f-project:checked")].map((c) => c.value));
+  const sources = new Set([...document.querySelectorAll(".f-source:checked")].map((c) => c.value));
+  const holeType = $("f-holetype").value;
+  if (h.latitude == null) return false;
+  if (!projects.has(h.project_name) || !sources.has(h.data_source)) return false;
+  if ($("f-planned-only").checked && h.coordinate_status !== "Planned") return false;
+  if (holeType && h.hole_type !== holeType) return false;
+  return true;
 }
 
 function renderHoles() {
-  const projects = new Set([...document.querySelectorAll(".f-project:checked")].map((c) => c.value));
-  const sources = new Set([...document.querySelectorAll(".f-source:checked")].map((c) => c.value));
-  const plannedOnly = $("f-planned-only").checked;
   holeLayer.clearLayers();
+  markerByHole.clear();
   let shown = 0;
   const bounds = [];
+  const selSet = selectedHoles ? new Set(selectedHoles.map((h) => h.hole_id)) : null;
   for (const h of allHoles) {
-    if (h.latitude == null) continue;
-    if (!projects.has(h.project_name) || !sources.has(h.data_source)) continue;
-    if (plannedOnly && h.coordinate_status !== "Planned") continue;
+    if (!holeVisible(h)) continue;
     const planned = h.coordinate_status === "Planned";
-    const color = PROJECT_COLORS[h.project_name] || "#888";
+    const color = colourFor(h);
+    const inSel = selSet ? selSet.has(h.hole_id) : true;
     const m = L.circleMarker([h.latitude, h.longitude], {
       radius: h.data_source === "QMines" ? 6 : 4.5,
-      color, weight: planned ? 2 : 1.5,
+      color: inSel ? color : "#777",
+      weight: planned ? 2 : 1.5,
       dashArray: planned ? "3 3" : null,
       fillColor: color,
-      fillOpacity: planned ? 0 : (h.data_source === "QMines" ? 0.9 : 0.45),
+      fillOpacity: !inSel ? 0.08 : planned ? 0 : (h.data_source === "QMines" ? 0.9 : 0.5),
+      opacity: inSel ? 1 : 0.35,
     });
     m.bindPopup(holePopup(h), { maxWidth: 300 });
     holeLayer.addLayer(m);
+    markerByHole.set(h.hole_id, { marker: m, hole: h });
     bounds.push([h.latitude, h.longitude]);
     shown++;
   }
   $("map-count").textContent = `${shown.toLocaleString()} of ${allHoles.length.toLocaleString()} holes shown`;
   if (bounds.length && !renderHoles._fitted) { map.fitBounds(bounds, { padding: [30, 30] }); renderHoles._fitted = true; }
+  updateLabels();
+}
+
+function updateLabels() {
+  const on = $("f-labels").checked && map.getZoom() >= LABEL_ZOOM;
+  const view = map.getBounds();
+  markerByHole.forEach(({ marker, hole }) => {
+    const should = on && view.contains(marker.getLatLng());
+    const has = !!marker.getTooltip();
+    if (should && !has) {
+      marker.bindTooltip(hole.hole_id, { permanent: true, direction: "right",
+        offset: [8, 0], className: "hole-label" });
+    } else if (!should && has) {
+      marker.unbindTooltip();
+    }
+  });
 }
 
 function holePopup(h) {
+  const mode = currentColourMode();
   const row = (k, v) => (v == null || v === "" ? "" : `<dt>${k}</dt><dd>${v}</dd>`);
+  const grade = mode !== "project" && h[mode] != null
+    ? row(GRADE_RAMPS[mode].label, h[mode].toLocaleString() + " " + GRADE_RAMPS[mode].unit) : "";
   return `<div class="popup-hole">${h.hole_id}</div>
     <dl class="popup-grid">
       ${row("Project", h.project_name)}
       ${row("Prospect", h.prospect)}
+      ${row("Tenement", h.tenement)}
       ${row("Source", h.data_source + (h.source_company && h.source_company !== "QMines" ? " (" + h.source_company + ")" : ""))}
       ${row("Type", h.hole_type)}
       ${row("Depth", h.max_depth != null ? h.max_depth + " m" : null)}
       ${row("Year", h.year)}
+      ${grade}
       ${row("East (MGA2020)", h.mga2020_east)}
       ${row("North (MGA2020)", h.mga2020_north)}
-      ${row("Zone", h.mga_zone)}
       ${row("Position", h.coordinate_status)}
     </dl>`;
 }
@@ -174,24 +316,27 @@ async function loadTenements() {
       color: "#e0a05c", weight: 2, fillOpacity: 0.04,
       dashArray: t.status && t.status.toLowerCase().includes("application") ? "6 4" : null,
     });
-    layer.bindPopup(`<div class="popup-hole">${t.tenement_number}</div>
+    layer.bindPopup(() => {
+      const n = allHoles.filter((h) => h.tenement === t.tenement_number).length;
+      return `<div class="popup-hole">${t.tenement_number}</div>
       <dl class="popup-grid">
         <dt>Status</dt><dd>${t.status || "\u2014"}</dd>
         <dt>Holder</dt><dd>${t.holder_name || "\u2014"}</dd>
         <dt>Minerals</dt><dd>${t.minerals || "\u2014"}</dd>
         <dt>Area</dt><dd>${t.area_ha ? t.area_ha.toLocaleString() + " ha" : "\u2014"}</dd>
         <dt>Expiry</dt><dd>${t.expiry_date || "\u2014"}</dd>
-      </dl>`, { maxWidth: 300 });
+        <dt>Drillholes</dt><dd>${n.toLocaleString()}</dd>
+      </dl>
+      <p class="popup-tip">Data tab \u2192 Tenement filter to browse/export these holes.</p>`;
+    }, { maxWidth: 300 });
     tenementLayer.addLayer(layer);
   }
 }
 
 function parseMultiPolygon(wkt) {
-  // "MULTIPOLYGON(((lon lat, ...),(hole ...)), ((...)))" -> Leaflet [[[lat,lon],...]] per polygon(with holes)
   if (!wkt) return [];
   const body = wkt.replace(/^\s*MULTIPOLYGON\s*/i, "").trim();
   const polygons = [];
-  // split top-level (( ... )) groups
   const polyRe = /\(\(([\s\S]*?)\)\)/g;
   let m;
   while ((m = polyRe.exec(body)) !== null) {
@@ -206,14 +351,99 @@ function parseMultiPolygon(wkt) {
   return polygons;
 }
 
+/* ---------- region selection ---------- */
+
+function pointInRing(lat, lon, ring) {
+  // ray casting; ring = [[lat,lon],...]
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [yi, xi] = ring[i], [yj, xj] = ring[j];
+    if ((yi > lat) !== (yj > lat) && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function applyRegionSelection(layer) {
+  let rings;
+  if (layer instanceof L.Rectangle || layer instanceof L.Polygon) {
+    const latlngs = layer.getLatLngs();
+    // normalize to array of outer rings
+    const outer = Array.isArray(latlngs[0]) ? latlngs[0] : latlngs;
+    rings = [outer.map((ll) => [ll.lat, ll.lng])];
+  } else return;
+  selectedHoles = allHoles.filter((h) =>
+    h.latitude != null && holeVisible(h) &&
+    rings.some((ring) => pointInRing(h.latitude, h.longitude, ring)));
+  $("sel-count").textContent = selectedHoles.length.toLocaleString();
+  $("selection-box").classList.remove("hidden");
+  renderHoles();
+}
+
+function clearSelection() {
+  selectedHoles = null;
+  drawLayer.clearLayers();
+  $("selection-box").classList.add("hidden");
+  renderHoles();
+}
+
+async function exportSelection() {
+  if (!selectedHoles || !selectedHoles.length) return;
+  const ids = selectedHoles.map((h) => h.hole_id);
+  const withRelated = $("sel-related").checked;
+  await exportHoleBundle(ids, withRelated, "map_selection");
+}
+
+/* ---------- shared bundle export (holes + daughter data) ---------- */
+
+const RELATED_TABLES = ["survey", "lithology_qmines", "lithology_historical", "rqd", "sg",
+                         "structure", "drilling_details", "samples_assays", "assay_results_by_method"];
+
+async function exportHoleBundle(holeIds, includeRelated, label) {
+  showLoading(`Exporting ${holeIds.length.toLocaleString()} holes\u2026`);
+  try {
+    // collars for the selection
+    let collars = [];
+    for (const ids of chunk(holeIds, ID_CHUNK)) {
+      const { data, error } = await sb.from("collars").select("*").in("hole_id", ids);
+      if (error) throw error;
+      collars = collars.concat(data);
+    }
+    if (!includeRelated) {
+      downloadBlob(new Blob([toCSV(collars)], { type: "text/csv" }),
+        `qmines_${label}_collars_${dateStamp()}.csv`);
+      return;
+    }
+    const zip = new JSZip();
+    zip.file("collars.csv", toCSV(collars));
+    for (const table of RELATED_TABLES) {
+      showLoading(`Exporting ${table.replaceAll("_", " ")}\u2026`);
+      let rows = [];
+      for (const ids of chunk(holeIds, ID_CHUNK)) {
+        const { data, error } = await sb.from(table).select("*").in("hole_id", ids);
+        if (error) throw error;
+        rows = rows.concat(data);
+      }
+      if (rows.length) zip.file(`${table}.csv`, toCSV(rows));
+    }
+    showLoading("Building zip\u2026");
+    const blob = await zip.generateAsync({ type: "blob" });
+    downloadBlob(blob, `qmines_${label}_${dateStamp()}.zip`);
+  } catch (err) {
+    alert("Export failed: " + (err.message || err));
+  } finally {
+    hideLoading();
+  }
+}
+
 /* ================= DATA BROWSER ================= */
 
 const TABLE_DEFS = {
   collars: {
-    cols: ["hole_id","project_name","prospect","data_source","source_company","hole_type",
+    cols: ["hole_id","project_name","prospect","tenement","data_source","source_company","hole_type",
            "mga2020_east","mga2020_north","rl","max_depth","year","coordinate_status"],
     projectCol: "project_name", prospectCol: "prospect", sourceCol: "data_source",
-    holeCol: "hole_id", order: "hole_id",
+    holeCol: "hole_id", holeTypeCol: "hole_type", coords: true, yearCol: "year",
+    tenementCol: "tenement", order: "hole_id",
   },
   samples_assays: {
     cols: ["sample_id","hole_id","from_m","to_m","sample_type","sample_priority","data_source",
@@ -269,11 +499,18 @@ $("d-hole").addEventListener("keydown", (e) => { if (e.key === "Enter") runQuery
 
 function syncFilterVisibility() {
   const def = TABLE_DEFS[$("table-select").value];
-  $("fg-project").style.display = (def.projectCol || def.embed) ? "" : "none";
-  $("fg-prospect").style.display = (def.prospectCol || def.embed) ? "" : "none";
-  $("fg-source").style.display = def.sourceCol ? "" : "none";
-  $("fg-hole").style.display = def.holeCol ? "" : "none";
-  $("fg-priority").style.display = def.priority ? "" : "none";
+  const show = (id, cond) => { $(id).style.display = cond ? "" : "none"; };
+  show("fg-project", !!(def.projectCol || def.embed));
+  show("fg-prospect", !!(def.prospectCol || def.embed));
+  show("fg-tenement", !!(def.tenementCol || def.embed));
+  show("fg-source", !!def.sourceCol);
+  show("fg-holetype", !!(def.holeTypeCol || def.embed));
+  show("fg-hole", !!def.holeCol);
+  show("fg-year", !!(def.yearCol || def.embed));
+  show("fg-east", !!(def.coords || def.embed));
+  show("fg-north", !!(def.coords || def.embed));
+  show("fg-priority", !!def.priority);
+  document.querySelector(".export-related").style.display = def.embed || def.coords ? "" : "none";
 }
 
 async function loadProspects() {
@@ -286,15 +523,40 @@ async function loadProspects() {
     prospects.map((p) => `<option>${p}</option>`).join("");
 }
 
+async function loadTenementList() {
+  const { data } = await sb.from("tenements").select("tenement_number").order("tenement_number");
+  $("d-tenement").innerHTML = '<option value="">All tenements</option>' +
+    (data || []).map((t) => `<option>${t.tenement_number}</option>`).join("");
+}
+
+function numOrNull(id) {
+  const v = $(id).value.trim();
+  return v === "" ? null : Number(v);
+}
+
 function buildQuery(def, table, { count = false, forExport = false } = {}) {
   const selectCols = forExport ? "*" : def.cols.join(",");
-  const embed = def.embed ? ",collars!inner(project_name,prospect)" : "";
+  const embed = def.embed ? ",collars!inner(project_name,prospect,tenement,hole_type,year,mga2020_east,mga2020_north)" : "";
   let q = sb.from(table).select(selectCols + embed, count ? { count: "exact" } : {});
   const project = $("d-project").value, prospect = $("d-prospect").value,
-        source = $("d-source").value, hole = $("d-hole").value.trim(),
-        priority = $("d-priority").value;
-  if (project) q = def.embed ? q.eq("collars.project_name", project) : (def.projectCol ? q.eq(def.projectCol, project) : q);
-  if (prospect) q = def.embed ? q.eq("collars.prospect", prospect) : (def.prospectCol ? q.eq(def.prospectCol, prospect) : q);
+        tenement = $("d-tenement").value, source = $("d-source").value,
+        holeType = $("d-holetype").value, hole = $("d-hole").value.trim(),
+        priority = $("d-priority").value,
+        yearMin = numOrNull("d-year-min"), yearMax = numOrNull("d-year-max"),
+        eastMin = numOrNull("d-east-min"), eastMax = numOrNull("d-east-max"),
+        northMin = numOrNull("d-north-min"), northMax = numOrNull("d-north-max");
+
+  const col = (own, name) => def.embed ? `collars.${name}` : own;
+  if (project && (def.projectCol || def.embed)) q = q.eq(col(def.projectCol, "project_name"), project);
+  if (prospect && (def.prospectCol || def.embed)) q = q.eq(col(def.prospectCol, "prospect"), prospect);
+  if (tenement && (def.tenementCol || def.embed)) q = q.eq(col(def.tenementCol, "tenement"), tenement);
+  if (holeType && (def.holeTypeCol || def.embed)) q = q.eq(col(def.holeTypeCol, "hole_type"), holeType);
+  if (yearMin != null && (def.yearCol || def.embed)) q = q.gte(col(def.yearCol, "year"), yearMin);
+  if (yearMax != null && (def.yearCol || def.embed)) q = q.lte(col(def.yearCol, "year"), yearMax);
+  if (eastMin != null && (def.coords || def.embed)) q = q.gte(col("mga2020_east", "mga2020_east"), eastMin);
+  if (eastMax != null && (def.coords || def.embed)) q = q.lte(col("mga2020_east", "mga2020_east"), eastMax);
+  if (northMin != null && (def.coords || def.embed)) q = q.gte(col("mga2020_north", "mga2020_north"), northMin);
+  if (northMax != null && (def.coords || def.embed)) q = q.lte(col("mga2020_north", "mga2020_north"), northMax);
   if (source && def.sourceCol) q = q.eq(def.sourceCol, source);
   if (hole && def.holeCol) q = q.ilike(def.holeCol, `%${hole}%`);
   if (priority && def.priority) q = q.eq("sample_priority", priority);
@@ -344,7 +606,7 @@ function renderTable(def, rows) {
       let v = r[c];
       if (v == null) { cells.push("<td></td>"); continue; }
       const isNum = typeof v === "number";
-      const cls = isNum ? "num" : (/_id$|^hole_id$|tenement_number/.test(c) ? "mono" : "");
+      const cls = isNum ? "num" : (/_id$|^hole_id$|tenement/.test(c) ? "mono" : "");
       const neg = isNum && v < 0 && /_ppm$|_pct$/.test(c);
       const shown = neg ? `<span class="below-dl">&lt;${Math.abs(v)}</span>` : String(v);
       cells.push(`<td class="${cls}">${shown}</td>`);
@@ -353,32 +615,39 @@ function renderTable(def, rows) {
   }).join("");
 }
 
-/* ================= CSV export ================= */
+/* ================= CSV / bundle export from Data view ================= */
 
 async function exportCSV() {
   const table = $("table-select").value;
   const def = TABLE_DEFS[table];
   if (!totalRows) { alert("Nothing to export — apply filters first."); return; }
+  const withRelated = $("export-related").checked && (def.embed || def.coords);
+
+  if (withRelated) {
+    // resolve the filtered set to hole_ids, then bundle everything for those holes
+    showLoading("Finding matching holes\u2026");
+    try {
+      const rows = await fetchAll(() => buildQuery(def, table, { forExport: true }));
+      const ids = [...new Set(rows.map((r) => r.hole_id).filter(Boolean))];
+      if (!ids.length) throw new Error("no holes in the filtered set");
+      await exportHoleBundle(ids, true, table);
+    } catch (err) {
+      alert("Export failed: " + (err.message || err));
+      hideLoading();
+    }
+    return;
+  }
+
   if (totalRows > 60000 && !confirm(`This will export ${totalRows.toLocaleString()} rows — it may take a minute. Continue?`)) return;
   showLoading(`Exporting ${totalRows.toLocaleString()} rows\u2026`);
   try {
     const rows = await fetchAll(() => buildQuery(def, table, { forExport: true }));
     if (!rows.length) throw new Error("no rows returned");
-    // flatten embedded project/prospect, drop nested object
     const flat = rows.map((r) => {
       const { collars, ...rest } = r;
       return def.embed ? { project_name: collars?.project_name, prospect: collars?.prospect, ...rest } : rest;
     });
-    const cols = Object.keys(flat[0]);
-    const esc = (v) => v == null ? "" : /[",\n]/.test(String(v)) ? '"' + String(v).replaceAll('"', '""') + '"' : String(v);
-    const csv = [cols.join(",")].concat(flat.map((r) => cols.map((c) => esc(r[c])).join(","))).join("\n");
-    const blob = new Blob([csv], { type: "text/csv" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    const stamp = new Date().toISOString().slice(0, 10);
-    a.download = `qmines_${table}_${stamp}.csv`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    downloadBlob(new Blob([toCSV(flat)], { type: "text/csv" }), `qmines_${table}_${dateStamp()}.csv`);
   } catch (err) {
     alert("Export failed: " + (err.message || err));
   } finally {
@@ -387,5 +656,6 @@ async function exportCSV() {
 }
 
 /* ================= boot ================= */
+renderLegend();
 syncFilterVisibility();
 init();

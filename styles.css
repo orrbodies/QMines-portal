@@ -197,3 +197,44 @@ td .below-dl { color: var(--muted); }
   .brand-sub { display: none; }
   .user-email { display: none; }
 }
+
+/* ---------- v2 additions ---------- */
+.login-logo { display: block; max-width: 200px; max-height: 56px; margin: 26px 28px 0; }
+.login-logo + .login-title { display: none; } /* hide text brand when logo present */
+.brand-logo { max-height: 34px; max-width: 140px; }
+.brand-logo + .brand-name { display: none; }
+.orr-credit {
+  margin: 22px 28px 0; padding-top: 14px; border-top: 1px solid var(--line);
+  font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px;
+}
+.orr-logo { max-height: 16px; max-width: 60px; }
+
+.grade-legend { margin-top: 8px; display: grid; gap: 4px; }
+.legend-title { font-size: 11.5px; font-weight: 600; color: var(--muted); }
+.legend-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.legend-row .swatch { border-radius: 50%; }
+
+.selection-box {
+  margin-top: 16px; padding: 12px; border: 1.5px solid var(--copper);
+  border-radius: 8px; background: rgba(184,115,51,.05);
+}
+.selection-box h2 { margin-top: 0 !important; }
+.selection-box .solid-btn, .selection-box .outline-btn { margin-top: 8px; padding: 8px; }
+
+.range-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.range-pair input {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  font: inherit; background: #fbfaf8;
+}
+.export-related { margin: 10px 0 2px; font-size: 13px; }
+
+.hole-label {
+  background: rgba(34,38,42,.82); color: #fff; border: 0; border-radius: 3px;
+  font-family: var(--mono); font-size: 10.5px; padding: 1px 5px;
+  box-shadow: none;
+}
+.hole-label::before { display: none; }
+.popup-tip { font-size: 11.5px; color: var(--muted); margin: 8px 0 0; }
+
+/* leaflet-draw button placement fits default; ensure above panels */
+.leaflet-draw-toolbar a { background-color: #fff; }

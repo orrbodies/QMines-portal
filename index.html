@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Semi+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -15,7 +16,8 @@
 <div id="login-screen" class="login-screen hidden">
   <div class="login-card">
     <div class="core-strip" aria-hidden="true"></div>
-    <h1>QMines<span class="dot">.</span></h1>
+    <img src="qmines_logo.png" alt="QMines" class="login-logo" onerror="this.remove()">
+    <h1 class="login-title">QMines<span class="dot">.</span></h1>
     <p class="login-sub">Drillhole Database</p>
     <form id="login-form">
       <label for="login-email">Email</label>
@@ -25,6 +27,7 @@
       <button type="submit" id="login-btn">Sign in</button>
       <p id="login-error" class="login-error" role="alert"></p>
     </form>
+    <p class="orr-credit"><img src="orr_logo.png" alt="" class="orr-logo" onerror="this.remove()">Database by Orr &amp; Associates</p>
   </div>
 </div>
 
@@ -32,6 +35,7 @@
 <div id="app" class="app hidden">
   <header class="topbar">
     <div class="brand">
+      <img src="qmines_logo.png" alt="QMines" class="brand-logo" onerror="this.remove()">
       <span class="brand-name">QMines<span class="dot">.</span></span>
       <span class="brand-sub">Drillhole Database</span>
     </div>
@@ -49,6 +53,17 @@
   <!-- ---------- MAP VIEW ---------- -->
   <main id="view-map" class="view active">
     <aside class="map-panel">
+      <h2>Colour holes by</h2>
+      <div class="filter-group">
+        <select id="colour-mode" aria-label="Colour holes by">
+          <option value="project">Project</option>
+          <option value="max_cu_ppm">Max Cu</option>
+          <option value="max_au_ppm">Max Au</option>
+          <option value="max_zn_ppm">Max Zn</option>
+        </select>
+        <div id="grade-legend" class="grade-legend hidden"></div>
+      </div>
+
       <h2>Layers</h2>
       <div class="filter-group">
         <span class="filter-label">Projects</span>
@@ -62,8 +77,13 @@
         <label class="chk"><input type="checkbox" class="f-source" value="Historical" checked>Historical</label>
       </div>
       <div class="filter-group">
+        <label class="filter-label" for="f-holetype">Hole type</label>
+        <select id="f-holetype"><option value="">All types</option></select>
+      </div>
+      <div class="filter-group">
         <span class="filter-label">Overlays</span>
         <label class="chk"><input type="checkbox" id="f-tenements" checked>Tenement boundaries</label>
+        <label class="chk"><input type="checkbox" id="f-labels" checked>Hole labels when zoomed in</label>
         <label class="chk"><input type="checkbox" id="f-planned-only">Planned coordinates only</label>
       </div>
       <div class="filter-group">
@@ -71,8 +91,17 @@
         <label class="chk"><input type="radio" name="basemap" value="satellite" checked>Satellite</label>
         <label class="chk"><input type="radio" name="basemap" value="street">Street</label>
       </div>
-      <p class="map-count" id="map-count">Loading holes\u2026</p>
-      <p class="legend-note">Dashed outline = collar not yet survey picked-up (planned position)</p>
+      <p class="map-count" id="map-count">Loading holes&hellip;</p>
+
+      <div id="selection-box" class="selection-box hidden">
+        <h2>Selection</h2>
+        <p class="map-count"><span id="sel-count">0</span> holes in drawn area</p>
+        <label class="chk"><input type="checkbox" id="sel-related" checked>Include all related data</label>
+        <button id="sel-export" class="solid-btn">Download selection</button>
+        <button id="sel-clear" class="outline-btn">Clear selection</button>
+      </div>
+
+      <p class="legend-note">Draw a region with the tools on the map (top-left) to select holes. Dashed marker outline = planned position, not yet surveyed.</p>
     </aside>
     <div id="map" class="map"></div>
   </main>
@@ -105,13 +134,42 @@
         <label class="filter-label" for="d-prospect">Prospect</label>
         <select id="d-prospect"><option value="">All prospects</option></select>
       </div>
+      <div class="filter-group" id="fg-tenement">
+        <label class="filter-label" for="d-tenement">Tenement</label>
+        <select id="d-tenement"><option value="">All tenements</option></select>
+      </div>
       <div class="filter-group" id="fg-source">
         <label class="filter-label" for="d-source">Data source</label>
         <select id="d-source"><option value="">All</option><option>QMines</option><option>Historical</option></select>
       </div>
+      <div class="filter-group" id="fg-holetype">
+        <label class="filter-label" for="d-holetype">Hole type</label>
+        <select id="d-holetype"><option value="">All types</option></select>
+      </div>
       <div class="filter-group" id="fg-hole">
         <label class="filter-label" for="d-hole">Hole ID contains</label>
         <input id="d-hole" type="text" placeholder="e.g. MCDD" spellcheck="false">
+      </div>
+      <div class="filter-group" id="fg-year">
+        <span class="filter-label">Year drilled</span>
+        <div class="range-pair">
+          <input id="d-year-min" type="number" placeholder="from" min="1900" max="2100">
+          <input id="d-year-max" type="number" placeholder="to" min="1900" max="2100">
+        </div>
+      </div>
+      <div class="filter-group" id="fg-east">
+        <span class="filter-label">Easting (MGA2020)</span>
+        <div class="range-pair">
+          <input id="d-east-min" type="number" placeholder="min">
+          <input id="d-east-max" type="number" placeholder="max">
+        </div>
+      </div>
+      <div class="filter-group" id="fg-north">
+        <span class="filter-label">Northing (MGA2020)</span>
+        <div class="range-pair">
+          <input id="d-north-min" type="number" placeholder="min">
+          <input id="d-north-max" type="number" placeholder="max">
+        </div>
       </div>
       <div class="filter-group" id="fg-priority">
         <label class="filter-label" for="d-priority">Sample priority</label>
@@ -123,6 +181,7 @@
         </select>
       </div>
       <button id="apply-btn" class="solid-btn">Apply filters</button>
+      <label class="chk export-related"><input type="checkbox" id="export-related">Include all related data</label>
       <button id="export-btn" class="outline-btn">Download CSV</button>
       <p class="export-note" id="export-note"></p>
     </aside>
@@ -143,9 +202,11 @@
   </main>
 </div>
 
-<div id="loading-overlay" class="loading-overlay hidden"><div class="spinner"></div><p id="loading-text">Working\u2026</p></div>
+<div id="loading-overlay" class="loading-overlay hidden"><div class="spinner"></div><p id="loading-text">Working&hellip;</p></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script src="config.js"></script>
 <script src="app.js"></script>
