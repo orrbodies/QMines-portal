@@ -115,9 +115,10 @@ const dateStamp = () => new Date().toISOString().slice(0, 10);
 
 /* ================= MAP ================= */
 
-let map = null, holeLayer = null, tenementLayer = null, drawLayer = null, basemaps = {};
+let map = null, holeLayer = null, tenementLayer = null, prospectLayer = null, drawLayer = null, basemaps = {};
 let allHoles = [];
 let markerByHole = new Map();
+let prospectMarkers = [];
 let selectedHoles = null; // array of hole objects inside drawn region, or null
 let appStarted = false;
 
@@ -128,6 +129,7 @@ async function startApp() {
   try {
     showLoading("Loading drillholes\u2026");
     await Promise.all([loadHoles(), loadTenements()]);
+    await loadProspectPoints(); // after holes, so popups can count linked drilling
     populateHoleTypes();
     renderHoles();
     hideLoading();
@@ -150,6 +152,7 @@ function initMap() {
   basemaps.satellite.addTo(map);
   holeLayer = L.layerGroup().addTo(map);
   tenementLayer = L.layerGroup().addTo(map);
+  prospectLayer = L.layerGroup().addTo(map);
   drawLayer = new L.FeatureGroup().addTo(map);
 
   // region-draw tools (polygon + rectangle)
@@ -181,8 +184,12 @@ function initMap() {
   $("colour-mode").addEventListener("change", () => { renderLegend(); renderHoles(); });
   $("f-tenements").addEventListener("change", (e) =>
     e.target.checked ? tenementLayer.addTo(map) : map.removeLayer(tenementLayer));
+  $("f-prospects").addEventListener("change", (e) => {
+    if (e.target.checked) { prospectLayer.addTo(map); updateProspectLabels(); }
+    else map.removeLayer(prospectLayer);
+  });
   $("f-labels").addEventListener("change", updateLabels);
-  map.on("zoomend moveend", updateLabels);
+  map.on("zoomend moveend", () => { updateLabels(); updateProspectLabels(); });
   $("sel-clear").addEventListener("click", clearSelection);
   $("sel-export").addEventListener("click", exportSelection);
 }
@@ -330,6 +337,77 @@ async function loadTenements() {
       <p class="popup-tip">Data tab \u2192 Tenement filter to browse/export these holes.</p>`;
     }, { maxWidth: 300 });
     tenementLayer.addLayer(layer);
+  }
+}
+
+/* ---------- prospect points layer ---------- */
+
+const PROSPECT_LABEL_ZOOM = 12;
+
+function normName(s) {
+  return String(s).toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function holesForProspectPoint(name) {
+  // match the point name (or each part of compound "A / B" names) against
+  // the drillholes' prospect attribution, ignoring case and punctuation
+  const parts = [name].concat(String(name).split(/\s*\/\s*/));
+  const targets = new Set(parts.map(normName).filter(Boolean));
+  return allHoles.filter((h) => h.prospect && targets.has(normName(h.prospect)));
+}
+
+async function loadProspectPoints() {
+  let rows = [];
+  try {
+    rows = await fetchAll(() => sb.from("prospects").select(
+      "prospect_name,project_name,latitude,longitude,mga2020_east,mga2020_north,mga_zone"));
+  } catch (e) {
+    return; // table not created yet - layer simply stays empty
+  }
+  for (const p of rows) {
+    if (p.latitude == null) continue;
+    const color = PROJECT_COLORS[p.project_name] || "#888";
+    const icon = L.divIcon({
+      className: "",
+      html: `<div class="prospect-pin" style="border-color:${color}"></div>`,
+      iconSize: [12, 12], iconAnchor: [6, 6],
+    });
+    const m = L.marker([p.latitude, p.longitude], { icon, zIndexOffset: -100 });
+    m.bindPopup(() => {
+      const linked = holesForProspectPoint(p.prospect_name);
+      const drillRow = linked.length
+        ? `<dt>Drillholes</dt><dd>${linked.length.toLocaleString()}</dd>`
+        : `<dt>Drillholes</dt><dd>none attributed</dd>`;
+      const tip = linked.length
+        ? `<p class="popup-tip">Data tab \u2192 Prospect filter to browse/export these holes.</p>` : "";
+      return `<div class="popup-hole">${p.prospect_name}</div>
+        <dl class="popup-grid">
+          <dt>Project</dt><dd>${p.project_name || "\u2014"}</dd>
+          ${drillRow}
+          <dt>East (MGA2020)</dt><dd>${p.mga2020_east}</dd>
+          <dt>North (MGA2020)</dt><dd>${p.mga2020_north}</dd>
+          <dt>Zone</dt><dd>${p.mga_zone}</dd>
+        </dl>${tip}`;
+    }, { maxWidth: 300 });
+    prospectLayer.addLayer(m);
+    prospectMarkers.push({ marker: m, name: p.prospect_name });
+  }
+  updateProspectLabels();
+}
+
+function updateProspectLabels() {
+  if (!map) return;
+  const on = map.getZoom() >= PROSPECT_LABEL_ZOOM && map.hasLayer(prospectLayer);
+  const view = map.getBounds();
+  for (const { marker, name } of prospectMarkers) {
+    const should = on && view.contains(marker.getLatLng());
+    const has = !!marker.getTooltip();
+    if (should && !has) {
+      marker.bindTooltip(name, { permanent: true, direction: "top",
+        offset: [0, -8], className: "prospect-label" });
+    } else if (!should && has) {
+      marker.unbindTooltip();
+    }
   }
 }
 
