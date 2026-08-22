@@ -476,16 +476,27 @@ async function exportSelection() {
 const RELATED_TABLES = ["survey", "lithology_qmines", "lithology_historical", "rqd", "sg",
                          "structure", "drilling_details", "samples_assays", "assay_results_by_method"];
 
-async function exportHoleBundle(holeIds, includeRelated, label) {
-  showLoading(`Exporting ${holeIds.length.toLocaleString()} holes\u2026`);
-  try {
-    // collars for the selection
-    let collars = [];
-    for (const ids of chunk(holeIds, ID_CHUNK)) {
-      const { data, error } = await sb.from("collars").select("*").in("hole_id", ids);
+async function fetchInChunks(table, holeIds) {
+  // pages through Supabase's 1000-row cap for each chunk of hole_ids
+  let rows = [];
+  for (const ids of chunk(holeIds, ID_CHUNK)) {
+    let from = 0;
+    for (;;) {
+      const { data, error } = await sb.from(table).select("*").in("hole_id", ids)
+        .range(from, from + FETCH_CHUNK - 1);
       if (error) throw error;
-      collars = collars.concat(data);
+      rows = rows.concat(data);
+      if (data.length < FETCH_CHUNK) break;
+      from += FETCH_CHUNK;
     }
+  }
+  return rows;
+}
+
+async function exportHoleBundle(holeIds, includeRelated, label) {
+  showLoading(`Exporting ${holeIds.length.toLocaleString()} holes…`);
+  try {
+    const collars = await fetchInChunks("collars", holeIds);
     if (!includeRelated) {
       downloadBlob(new Blob([toCSV(collars)], { type: "text/csv" }),
         `qmines_${label}_collars_${dateStamp()}.csv`);
@@ -494,16 +505,11 @@ async function exportHoleBundle(holeIds, includeRelated, label) {
     const zip = new JSZip();
     zip.file("collars.csv", toCSV(collars));
     for (const table of RELATED_TABLES) {
-      showLoading(`Exporting ${table.replaceAll("_", " ")}\u2026`);
-      let rows = [];
-      for (const ids of chunk(holeIds, ID_CHUNK)) {
-        const { data, error } = await sb.from(table).select("*").in("hole_id", ids);
-        if (error) throw error;
-        rows = rows.concat(data);
-      }
+      showLoading(`Exporting ${table.replaceAll("_", " ")}…`);
+      const rows = await fetchInChunks(table, holeIds);
       if (rows.length) zip.file(`${table}.csv`, toCSV(rows));
     }
-    showLoading("Building zip\u2026");
+    showLoading("Building zip…");
     const blob = await zip.generateAsync({ type: "blob" });
     downloadBlob(blob, `qmines_${label}_${dateStamp()}.zip`);
   } catch (err) {
