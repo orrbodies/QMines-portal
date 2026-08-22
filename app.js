@@ -476,14 +476,30 @@ async function exportSelection() {
 const RELATED_TABLES = ["survey", "lithology_qmines", "lithology_historical", "rqd", "sg",
                          "structure", "drilling_details", "samples_assays", "assay_results_by_method"];
 
+const TABLE_ORDER_COLS = {
+  collars: ["hole_id"],
+  survey: ["hole_id", "depth"],
+  lithology_qmines: ["hole_id", "from_m"],
+  lithology_historical: ["hole_id", "from_m"],
+  rqd: ["hole_id", "from_m"],
+  sg: ["hole_id", "from_m"],
+  structure: ["hole_id", "depth"],
+  drilling_details: ["hole_id"],
+  samples_assays: ["sample_id"],
+  assay_results_by_method: ["sample_id", "element", "method"],
+};
+
 async function fetchInChunks(table, holeIds) {
-  // pages through Supabase's 1000-row cap for each chunk of hole_ids
+  // pages through Supabase's Max Rows cap for each chunk of hole_ids;
+  // explicit order() makes each page a stable, non-overlapping slice
   let rows = [];
+  const orderCols = TABLE_ORDER_COLS[table] || ["hole_id"];
   for (const ids of chunk(holeIds, ID_CHUNK)) {
     let from = 0;
     for (;;) {
-      const { data, error } = await sb.from(table).select("*").in("hole_id", ids)
-        .range(from, from + FETCH_CHUNK - 1);
+      let q = sb.from(table).select("*").in("hole_id", ids);
+      for (const col of orderCols) q = q.order(col);
+      const { data, error } = await q.range(from, from + FETCH_CHUNK - 1);
       if (error) throw error;
       rows = rows.concat(data);
       if (data.length < FETCH_CHUNK) break;
