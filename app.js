@@ -573,7 +573,7 @@ const TABLE_DEFS = {
     embed: true, holeCol: "hole_id", order: "hole_id",
   },
   structure: {
-    cols: ["hole_id","depth","planar_structure","dip","dip_direction","comment"],
+        cols: ["hole_id","depth","planar_structure","alpha","beta","dip","dip_direction","thickness_mm","mineral_1","mineral_2","mineral_3","mineral_4","comment"],
     embed: true, holeCol: "hole_id", order: "hole_id",
   },
   assay_results_by_method: {
